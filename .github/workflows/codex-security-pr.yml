@@ -7,14 +7,18 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: codex-security-mock-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   security:
+    name: Codex Security Mock
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     env:
-      CS_RESULTS: ${{ runner.temp }}/codex-security-mock
       ENFORCE_POLICY: "false"
 
     steps:
@@ -26,69 +30,101 @@ jobs:
           persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v7.1.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
-          package-manager-cache: false
 
-      - name: Run synthetic security scan
+      - name: Run mock diff scan
         id: scan
         shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
+          set -euo pipefail
+
+          SCAN_DIR="$RUNNER_TEMP/cs-mock-scan"
+          export CODEX_SECURITY_STATE_DIR="$RUNNER_TEMP/cs-mock-state"
+
+          mkdir -p "$CODEX_SECURITY_STATE_DIR"
+
           set +e
           npx --yes @openai/codex-security@0.8.2 scan . \
-            --diff "${{ github.event.pull_request.base.sha }}" \
-            --head "${{ github.event.pull_request.head.sha }}" \
+            --diff "$BASE_SHA" \
+            --head "$HEAD_SHA" \
             --mock \
             --headless \
-            --json \
-            --output-dir "$CS_RESULTS" \
+            --output-dir "$SCAN_DIR" \
             --fail-on-severity high \
-            > "$RUNNER_TEMP/mock-scan.json"
-          rc=$?
+            > "$RUNNER_TEMP/cs-mock-stdout.log" 2>&1
+
+          scan_rc=$?
           set -e
 
-          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
-          echo "Scanner exit code: $rc"
+          echo "exit_code=$scan_rc" >> "$GITHUB_OUTPUT"
+          echo "Scanner exit code: $scan_rc"
 
-          if (( rc != 0 && rc != 1 )); then
-            exit "$rc"
+          if [[ "$scan_rc" -ne 0 && "$scan_rc" -ne 1 ]]; then
+            cat "$RUNNER_TEMP/cs-mock-stdout.log"
+            exit "$scan_rc"
           fi
 
-      - name: Inspect findings and export SARIF
-        if: ${{ steps.scan.outputs.exit_code == '0' || steps.scan.outputs.exit_code == '1' }}
+      - name: Validate JSON and export SARIF
+        shell: bash
         run: |
+          set -euo pipefail
+
+          SCAN_DIR="$RUNNER_TEMP/cs-mock-scan"
+          SARIF="$RUNNER_TEMP/cs-mock-results.sarif"
+
+          jq -e '
+            .documentType == "codex-security.findings"
+            and (.findings | type == "array")
+            and (.findings | length == 12)
+          ' "$SCAN_DIR/findings.json" > /dev/null
+
           npx --yes @openai/codex-security@0.8.2 export \
-            "$CS_RESULTS" \
+            "$SCAN_DIR" \
             --source-root . \
-            --output "$RUNNER_TEMP/mock-results.sarif"
+            --output "$SARIF"
 
-          jq -e '(.findings | length) == 12' \
-            "$CS_RESULTS/findings.json"
+          jq -e '
+            .version == "2.1.0"
+            and (.runs | type == "array")
+          ' "$SARIF" > /dev/null
 
-          jq -e '.version == "2.1.0" and (.runs | type == "array")' \
-            "$RUNNER_TEMP/mock-results.sarif"
+          echo "Mock findings: 12"
+          echo "SARIF export: valid"
 
-          jq '[.findings[].severity.level] | group_by(.) | map({
-            severity: .[0],
-            count: length
-          })' "$CS_RESULTS/findings.json"
+          jq -r '
+            [.findings[].severity.level]
+            | group_by(.)
+            | .[]
+            | "\(.[0]): \(length)"
+          ' "$SCAN_DIR/findings.json"
 
       - name: Upload mock artifacts
-        if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: codex-security-mock-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/codex-security-mock/findings.json
-            ${{ runner.temp }}/codex-security-mock/scan-manifest.json
-            ${{ runner.temp }}/codex-security-mock/report.md
-            ${{ runner.temp }}/mock-results.sarif
-            ${{ runner.temp }}/mock-scan.json
+            ${{ runner.temp }}/cs-mock-scan/findings.json
+            ${{ runner.temp }}/cs-mock-scan/scan-manifest.json
+            ${{ runner.temp }}/cs-mock-scan/report.md
+            ${{ runner.temp }}/cs-mock-results.sarif
+            ${{ runner.temp }}/cs-mock-stdout.log
           retention-days: 7
           if-no-files-found: warn
 
       - name: Enforce security policy
         if: ${{ env.ENFORCE_POLICY == 'true' }}
+        shell: bash
         run: |
-          test "${{ steps.scan.outputs.exit_code }}" = "0"
+          if [[ "${{ steps.scan.outputs.exit_code }}" == "1" ]]; then
+            echo "::error::Security findings exceeded the severity threshold"
+            exit 1
+          fi
+
+          echo "Security policy passed"
+
