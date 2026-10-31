@@ -1,0 +1,87 @@
+
+name: Codex Security Commands
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  help:
+    name: Handle /security help
+    if: >-
+      github.repository == 'toasted-cornkernels/codeql-sap-js' &&
+      github.event.issue.pull_request &&
+      github.event.comment.body == '/security help'
+
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Verify commenter permissions
+        id: authorize
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTHOR: ${{ github.event.comment.user.login }}
+        run: |
+          set -euo pipefail
+
+          if ! permission="$(
+            gh api \
+              "repos/$GITHUB_REPOSITORY/collaborators/$AUTHOR/permission" \
+              --jq '.permission' 2>/dev/null
+          )"; then
+            echo "Authorization unavailable or user not found"
+            exit 1
+          fi
+
+          case "$permission" in
+            admin|write)
+              echo "authorized=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "User is not authorized: $permission"
+              exit 1
+              ;;
+          esac
+
+      - name: Reply with command help
+        if: steps.authorize.outputs.authorized == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+
+          body="$(cat <<'EOF'
+          ## Codex Security — Command Help
+
+          Hello from the security bot!
+
+          Available commands:
+
+          - `/security help` — Show this help message.
+
+          Planned commands:
+
+          - `/security scan` — Request a security scan.
+          - `/security context add <ID>` — Add approved context.
+          - `/security explain <ID>` — Explain a finding.
+
+          **Experiment 08.1: No security scan was executed.**
+
+          Only authorized repository collaborators can invoke commands.
+          EOF
+          )"
+
+          gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            -f body="$body"
+
