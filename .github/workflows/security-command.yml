@@ -91,7 +91,7 @@ jobs:
           # Exact ID allowlist. Do not accept arbitrary paths or file names
           # provided through a PR comment.
           case "$KB_ID" in
-            KB-1042) KB_PATH='security/knowledge-base/KB-1042.md' ;;
+            KB-1042) KB_PATH='security/knowledge/KB-1042.md' ;;
             *)
               BODY="Rejected: \`$KB_ID\` is not an allowlisted Knowledge Base ID. No context was registered."
               gh api --method POST "repos/$REPO/issues/$PR/comments" -f body="$BODY" > /dev/null
