@@ -1,30 +1,23 @@
-name: Codex Security PR
+name: Codex Security Mock CI
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
 
-concurrency:
-  group: codex-security-pr-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 jobs:
   security:
-    name: Codex Security
-    if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 20
+
+    env:
+      CS_RESULTS: ${{ runner.temp }}/codex-security-mock
+      ENFORCE_POLICY: "false"
 
     steps:
-      - name: Set up sandbox
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes bubblewrap apparmor-profiles
-          sudo apparmor_parser -r /usr/share/apparmor/extra-profiles/bwrap-userns-restrict
-
       - name: Checkout PR
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -32,21 +25,70 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Codex Security diff scan
-        id: security
-        uses: openai/codex-security@400aab4fa5c3376df00bf0d79b65222953170f0d # action-v0.8.2
+      - name: Set up Node.js
+        uses: actions/setup-node@v7.1.0
         with:
-          scope: diff
-          model: gpt-5.6-sol
-          effort: high
-          fail-on-severity: none
-          max-cost: "20"
-          verbose: "false"
-          upload-artifacts: "true"
-          retention-days: "7"
-          dry-run: "true"
-        # For a real scan, set dry-run to "false"
-        # and uncomment the following:
-        # env:
-        #   OPENAI_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+          node-version: "24"
+          package-manager-cache: false
 
+      - name: Run synthetic security scan
+        id: scan
+        shell: bash
+        run: |
+          set +e
+          npx --yes @openai/codex-security@0.8.2 scan . \
+            --diff "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}" \
+            --mock \
+            --headless \
+            --json \
+            --output-dir "$CS_RESULTS" \
+            --fail-on-severity high \
+            > "$RUNNER_TEMP/mock-scan.json"
+          rc=$?
+          set -e
+
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          echo "Scanner exit code: $rc"
+
+          if (( rc != 0 && rc != 1 )); then
+            exit "$rc"
+          fi
+
+      - name: Inspect findings and export SARIF
+        if: ${{ steps.scan.outputs.exit_code == '0' || steps.scan.outputs.exit_code == '1' }}
+        run: |
+          npx --yes @openai/codex-security@0.8.2 export \
+            "$CS_RESULTS" \
+            --source-root . \
+            --output "$RUNNER_TEMP/mock-results.sarif"
+
+          jq -e '(.findings | length) == 12' \
+            "$CS_RESULTS/findings.json"
+
+          jq -e '.version == "2.1.0" and (.runs | type == "array")' \
+            "$RUNNER_TEMP/mock-results.sarif"
+
+          jq '[.findings[].severity.level] | group_by(.) | map({
+            severity: .[0],
+            count: length
+          })' "$CS_RESULTS/findings.json"
+
+      - name: Upload mock artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codex-security-mock-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/codex-security-mock/findings.json
+            ${{ runner.temp }}/codex-security-mock/scan-manifest.json
+            ${{ runner.temp }}/codex-security-mock/report.md
+            ${{ runner.temp }}/mock-results.sarif
+            ${{ runner.temp }}/mock-scan.json
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Enforce security policy
+        if: ${{ env.ENFORCE_POLICY == 'true' }}
+        run: |
+          test "${{ steps.scan.outputs.exit_code }}" = "0"
