@@ -1,0 +1,172 @@
+# Experimental workflow for toasted-cornkernels/codeql-sap-js only.
+# All findings are SYNTHETIC. No API key or model calls are used.
+name: Codex Security Mock CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+concurrency:
+  group: codex-security-mock-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  generate:
+    name: Generate synthetic findings
+    if: github.repository == 'toasted-cornkernels/codeql-sap-js' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      scan_exit_code: ${{ steps.scan.outputs.exit_code }}
+
+    steps:
+      - name: Checkout PR commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Generate mock diff findings
+        id: scan
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          SCAN_DIR="$RUNNER_TEMP/cs-mock-scan"
+          export CODEX_SECURITY_STATE_DIR="$RUNNER_TEMP/cs-mock-state"
+          mkdir -p "$CODEX_SECURITY_STATE_DIR"
+
+          set +e
+          npx --yes @openai/codex-security@0.8.2 scan . \
+            --diff "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --mock \
+            --headless \
+            --output-dir "$SCAN_DIR" \
+            --fail-on-severity high \
+            > "$RUNNER_TEMP/cs-mock-stdout.log" 2>&1
+          scan_rc=$?
+          set -e
+
+          echo "exit_code=$scan_rc" >> "$GITHUB_OUTPUT"
+          echo "Mock scanner exit code: $scan_rc"
+          if [[ "$scan_rc" -ne 0 && "$scan_rc" -ne 1 ]]; then
+            cat "$RUNNER_TEMP/cs-mock-stdout.log"
+            exit "$scan_rc"
+          fi
+
+      - name: Validate findings and package SARIF
+        shell: bash
+        run: |
+          set -euo pipefail
+          SCAN_DIR="$RUNNER_TEMP/cs-mock-scan"
+          BUNDLE_DIR="$RUNNER_TEMP/cs-mock-artifacts"
+          mkdir -p "$BUNDLE_DIR"
+
+          jq -e '
+            .documentType == "codex-security.findings"
+            and (.findings | type == "array")
+            and (.findings | length == 12)
+          ' "$SCAN_DIR/findings.json" > /dev/null
+
+          npx --yes @openai/codex-security@0.8.2 export \
+            "$SCAN_DIR" --source-root . --output "$BUNDLE_DIR/results.sarif"
+
+          jq -e '
+            .version == "2.1.0"
+            and (.runs | type == "array")
+          ' "$BUNDLE_DIR/results.sarif" > /dev/null
+
+          cp "$SCAN_DIR/findings.json" "$SCAN_DIR/scan-manifest.json" \
+            "$SCAN_DIR/report.md" "$RUNNER_TEMP/cs-mock-stdout.log" "$BUNDLE_DIR/"
+
+          {
+            echo '## Codex Security — synthetic CI experiment'
+            echo
+            echo '**TEST DATA ONLY: These are not vulnerabilities found in this repository.**'
+            echo
+            echo '| Severity | Mock findings |'
+            echo '| --- | ---: |'
+            jq -r '
+              [.findings[].severity.level] | group_by(.) | .[] |
+              "| \(.[0]) | \(length) |"
+            ' "$SCAN_DIR/findings.json"
+            echo
+            echo 'SARIF 2.1.0 validated; the artifact will be submitted to Code Scanning in a separate, narrowly privileged job.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Archive mock artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codex-security-synthetic-${{ github.run_id }}
+          path: ${{ runner.temp }}/cs-mock-artifacts/
+          retention-days: 7
+          if-no-files-found: warn
+
+  publish:
+    name: Publish synthetic SARIF to Code Scanning
+    needs: generate
+    if: needs.generate.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      # Change to "true" later to test a blocking policy gate.
+      ENFORCE_POLICY: 'true'
+      SCAN_EXIT_CODE: ${{ needs.generate.outputs.scan_exit_code }}
+
+    steps:
+      - name: Checkout analyzed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Download mock SARIF artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: codex-security-synthetic-${{ github.run_id }}
+          path: ${{ runner.temp }}/cs-mock-artifacts
+
+      - name: Verify downloaded SARIF
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -e '.version == "2.1.0" and (.runs | type == "array")' \
+            "$RUNNER_TEMP/cs-mock-artifacts/results.sarif" > /dev/null
+
+      - name: Upload synthetic SARIF to Code Scanning
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
+        with:
+          sarif_file: ${{ runner.temp }}/cs-mock-artifacts/results.sarif
+          category: codex-security-synthetic-lab
+          ref: refs/pull/${{ github.event.pull_request.number }}/head
+          sha: ${{ github.event.pull_request.head.sha }}
+          wait-for-processing: 'true'
+
+      - name: Optional blocking policy gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$ENFORCE_POLICY" == 'true' && "$SCAN_EXIT_CODE" == '1' ]]; then
+            echo '::error::Synthetic High/Critical finding exceeded policy threshold.'
+            exit 1
+          fi
+          echo "Policy mode: advisory; mock scanner exit code: $SCAN_EXIT_CODE"
+
