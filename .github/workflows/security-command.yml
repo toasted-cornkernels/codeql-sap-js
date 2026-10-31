@@ -1,4 +1,5 @@
-
+# Install on the default branch (main) of toasted-cornkernels/codeql-sap-js.
+# Experiment 08.2: only metadata registration; no scanning or model calls.
 name: Codex Security Commands
 
 on:
@@ -7,81 +8,142 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: security-command-${{ github.event.comment.id }}
+  cancel-in-progress: false
+
 jobs:
-  help:
-    name: Handle /security help
+  dispatch:
+    name: Handle authorized security command
     if: >-
       github.repository == 'toasted-cornkernels/codeql-sap-js' &&
       github.event.issue.pull_request &&
-      github.event.comment.body == '/security help'
-
+      startsWith(github.event.comment.body, '/security')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-
     permissions:
+      contents: read
       pull-requests: write
 
     steps:
-      - name: Verify commenter permissions
-        id: authorize
+      # Deliberately NO checkout of PR code, installation, eval, or shell
+      # interpolation of the comment. Every command is explicitly parsed.
+      - name: Validate request and respond
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          AUTHOR: ${{ github.event.comment.user.login }}
         run: |
           set -euo pipefail
 
-          if ! permission="$(
-            gh api \
-              "repos/$GITHUB_REPOSITORY/collaborators/$AUTHOR/permission" \
-              --jq '.permission' 2>/dev/null
-          )"; then
-            echo "Authorization unavailable or user not found"
-            exit 1
+          REPO="$GITHUB_REPOSITORY"
+          [[ "$REPO" == 'toasted-cornkernels/codeql-sap-js' ]] || exit 1
+
+          REQUEST="$(jq -r '.comment.body' "$GITHUB_EVENT_PATH")"
+          AUTHOR="$(jq -r '.comment.user.login' "$GITHUB_EVENT_PATH")"
+          PR="$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")"
+          [[ "$AUTHOR" =~ ^[A-Za-z0-9-]+$ && "$PR" =~ ^[0-9]+$ ]] || exit 1
+
+          if [[ "$REQUEST" == '/security help' ]]; then
+            COMMAND=help
+          elif [[ "$REQUEST" =~ ^/security\ context\ add\ (KB-[0-9]+)$ ]]; then
+            COMMAND=context
+            KB_ID="${BASH_REMATCH[1]}"
+          else
+            echo 'Not a recognized security command; no action taken.'
+            exit 0
           fi
 
-          case "$permission" in
-            admin|write)
-              echo "authorized=true" >> "$GITHUB_OUTPUT"
-              ;;
+          # A comment from a collaborator is NOT authorization: query actual
+          # repository permissions. Fail closed on API errors or lower access.
+          if ! PERMISSION="$(gh api \
+            "repos/$REPO/collaborators/$AUTHOR/permission" \
+            --jq '.permission' 2>/dev/null)"; then
+            echo 'Cannot verify commenter authorization; no action taken.'
+            exit 1
+          fi
+          case "$PERMISSION" in
+            admin|write) ;;
+            *) echo 'Commenter lacks write access; no action taken.'; exit 0 ;;
+          esac
+
+          PR_METADATA="$RUNNER_TEMP/pr.json"
+          gh api "repos/$REPO/pulls/$PR" > "$PR_METADATA"
+          [[ "$(jq -r '.state' "$PR_METADATA")" == 'open' ]] || exit 1
+          HEAD_SHA="$(jq -r '.head.sha' "$PR_METADATA")"
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+
+          if [[ "$COMMAND" == help ]]; then
+            BODY="$(cat <<'EOF'
+          ## Codex Security — Command Help
+
+          Available commands:
+          - `/security help` — Show command help.
+          - `/security context add KB-1042` — Record the approved KB document for this PR.
+
+          This experiment **does not run a scan** or pass context to Codex Security yet.
+          EOF
+          )"
+            gh api --method POST "repos/$REPO/issues/$PR/comments" -f body="$BODY" > /dev/null
+            echo 'Posted help response.'
+            exit 0
+          fi
+
+          # Exact ID allowlist. Do not accept arbitrary paths or file names
+          # provided through a PR comment.
+          case "$KB_ID" in
+            KB-1042) KB_PATH='security/knowledge-base/KB-1042.md' ;;
             *)
-              echo "User is not authorized: $permission"
-              exit 1
+              BODY="Rejected: \`$KB_ID\` is not an allowlisted Knowledge Base ID. No context was registered."
+              gh api --method POST "repos/$REPO/issues/$PR/comments" -f body="$BODY" > /dev/null
+              exit 0
               ;;
           esac
 
-      - name: Reply with command help
-        if: steps.authorize.outputs.authorized == 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.issue.number }}
-        run: |
-          set -euo pipefail
+          # Resolve and pin the trusted main-branch revision before reading.
+          MAIN_SHA="$(gh api "repos/$REPO/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$MAIN_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          KB_META="$RUNNER_TEMP/kb.json"
+          if ! gh api "repos/$REPO/contents/$KB_PATH?ref=$MAIN_SHA" > "$KB_META" 2>/dev/null; then
+            BODY="Cannot register \`$KB_ID\`: approved document not found on the personal fork's \`main\` branch at \`$KB_PATH\`. No scan was run."
+            gh api --method POST "repos/$REPO/issues/$PR/comments" -f body="$BODY" > /dev/null
+            exit 0
+          fi
+          jq -e '.type == "file" and .encoding == "base64" and (.size > 0) and (.size <= 32768)' "$KB_META" > /dev/null
+          KB_BLOB="$(jq -r '.sha' "$KB_META")"
+          [[ "$KB_BLOB" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          jq -r '.content' "$KB_META" | base64 --decode > "$RUNNER_TEMP/kb.md"
+          grep -Fxq 'Status: Approved' "$RUNNER_TEMP/kb.md" || {
+            echo 'Trusted KB document lacks the required approval marker.'
+            exit 1
+          }
 
-          body="$(cat <<'EOF'
-          ## Codex Security — Command Help
+          # The bot comment is the auditable registration record. It is NOT
+          # an authorization policy or a new source of agent instructions.
+          MARKER="<!-- codex-security-context:$KB_ID:$KB_BLOB:$HEAD_SHA -->"
+          gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | .body' \
+            > "$RUNNER_TEMP/bot-comments.txt"
+          if grep -Fq -- "$MARKER" "$RUNNER_TEMP/bot-comments.txt"; then
+            echo 'Identical KB and PR revision already recorded; skipping duplicate.'
+            exit 0
+          fi
 
-          Hello from the security bot!
+          BODY="$(cat <<EOF
+          ## Codex Security — Context registered (metadata only)
 
-          Available commands:
+          - **Knowledge ID:** \`$KB_ID\`
+          - **Trusted source:** \`$KB_PATH\` on \`main\`
+          - **Main commit:** \`$MAIN_SHA\`
+          - **KB blob SHA:** \`$KB_BLOB\`
+          - **PR head SHA:** \`$HEAD_SHA\`
+          - **Requested by:** @$AUTHOR
+          - **Document:** https://github.com/$REPO/blob/$MAIN_SHA/$KB_PATH
 
-          - `/security help` — Show this help message.
+          **No security scan was started.** This records which reviewed document a future scan dispatcher should fetch; the current CI scanner does not consume this registration automatically.
 
-          Planned commands:
-
-          - `/security scan` — Request a security scan.
-          - `/security context add <ID>` — Add approved context.
-          - `/security explain <ID>` — Explain a finding.
-
-          **Experiment 08.1: No security scan was executed.**
-
-          Only authorized repository collaborators can invoke commands.
+          $MARKER
           EOF
           )"
-
-          gh api \
-            --method POST \
-            "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
-            -f body="$body"
+          gh api --method POST "repos/$REPO/issues/$PR/comments" -f body="$BODY" > /dev/null
+          echo "Recorded $KB_ID for PR #$PR at $HEAD_SHA."
 
