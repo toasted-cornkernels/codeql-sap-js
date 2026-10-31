@@ -128,7 +128,7 @@ jobs:
       security-events: write
     env:
       # Change to "true" later to test a blocking policy gate.
-      ENFORCE_POLICY: 'false'
+      ENFORCE_POLICY: 'true'
       SCAN_EXIT_CODE: ${{ needs.generate.outputs.scan_exit_code }}
 
     steps:
