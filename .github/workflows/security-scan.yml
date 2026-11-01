@@ -150,14 +150,20 @@ jobs:
             and (.findings | type == "array")
           ' "$SCAN_DIR/findings.json" > /dev/null
 
+          # Export outside the original scan artifact directory.
+          EXPORT_SARIF="$RUNNER_TEMP/cs-results-export.sarif"
+
           npx --yes @openai/codex-security@0.8.2 export \
             "$SCAN_DIR" \
             --source-root . \
-            --output "$SCAN_DIR/results.sarif"
+            --output "$EXPORT_SARIF"
 
+          # Validate the exported SARIF.
           jq -e '.version == "2.1.0"' \
-            "$SCAN_DIR/results.sarif" > /dev/null
+            "$EXPORT_SARIF" > /dev/null
 
+          # Include the validated export in the uploaded artifact.
+          cp "$EXPORT_SARIF" "$SCAN_DIR/results.sarif"
           cp "$RUNNER_TEMP/scan.log" "$SCAN_DIR/scan.log"
 
           echo "Mock scan exit code: $scan_rc"
