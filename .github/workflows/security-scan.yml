@@ -1,0 +1,223 @@
+name: Codex Security Scan
+
+run-name: "Security scan PR #${{ inputs.pr }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number
+        required: true
+        type: string
+      base:
+        description: PR base SHA
+        required: true
+        type: string
+      head:
+        description: PR head SHA
+        required: true
+        type: string
+      kb:
+        description: Knowledge Base ID
+        required: true
+        type: string
+      blob:
+        description: KB Git blob SHA
+        required: true
+        type: string
+      main:
+        description: Trusted main commit SHA
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: security-scan-pr-${{ inputs.pr }}
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    if: github.repository == 'toasted-cornkernels/codeql-sap-js'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Verify snapshot and trusted KB
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+          BASE: ${{ inputs.base }}
+          HEAD: ${{ inputs.head }}
+          KB: ${{ inputs.kb }}
+          BLOB: ${{ inputs.blob }}
+          MAIN: ${{ inputs.main }}
+        run: |
+          set -euo pipefail
+
+          [[ "$PR" =~ ^[0-9]+$ ]]
+          [[ "$KB" =~ ^KB-[0-9]+$ ]]
+
+          for sha in "$BASE" "$HEAD" "$BLOB" "$MAIN"; do
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          done
+
+          pr_json="$(
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$PR"
+          )"
+
+          # A rerun may legitimately refer to an older PR commit.
+          current_head="$(jq -r '.head.sha' <<< "$pr_json")"
+
+          if [[ "$current_head" != "$HEAD" ]]; then
+            echo "::warning::Historical scan: PR head has moved"
+          fi
+
+          # The trusted commit must remain in main's history.
+          comparison="$(
+            gh api \
+              "repos/$GITHUB_REPOSITORY/compare/$MAIN...main" \
+              --jq '.status'
+          )"
+
+          [[ "$comparison" == "ahead" ||
+             "$comparison" == "identical" ]] || exit 1
+
+          kb_json="$(
+            gh api \
+              "repos/$GITHUB_REPOSITORY/contents/security/knowledge/$KB.md?ref=$MAIN"
+          )"
+
+          [[ "$(jq -r '.sha' <<< "$kb_json")" == "$BLOB" ]] ||
+            { echo "::error::KB blob mismatch"; exit 1; }
+
+          jq -r '.content' <<< "$kb_json" |
+            base64 --decode > "$RUNNER_TEMP/approved-kb.md"
+
+          grep -Fxq 'Status: Approved' \
+            "$RUNNER_TEMP/approved-kb.md" || {
+              echo "::error::Unapproved KB"
+              exit 1
+            }
+
+          echo "Verified $KB at blob $BLOB"
+
+      - name: Checkout exact PR commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.head }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run Codex Security mock scan
+        shell: bash
+        env:
+          BASE: ${{ inputs.base }}
+          HEAD: ${{ inputs.head }}
+        run: |
+          set -euo pipefail
+
+          export CODEX_SECURITY_STATE_DIR="$RUNNER_TEMP/cs-state"
+          SCAN_DIR="$RUNNER_TEMP/cs-results"
+
+          mkdir -p "$CODEX_SECURITY_STATE_DIR" "$SCAN_DIR"
+
+          set +e
+          npx --yes @openai/codex-security@0.8.2 scan . \
+            --diff "$BASE" \
+            --head "$HEAD" \
+            --knowledge-base "$RUNNER_TEMP/approved-kb.md" \
+            --mock \
+            --headless \
+            --output-dir "$SCAN_DIR" \
+            --fail-on-severity high \
+            > "$RUNNER_TEMP/scan.log" 2>&1
+          scan_rc=$?
+          set -e
+
+          # Mock findings may intentionally trigger the severity gate.
+          if [[ "$scan_rc" -ne 0 && "$scan_rc" -ne 1 ]]; then
+            cat "$RUNNER_TEMP/scan.log"
+            exit "$scan_rc"
+          fi
+
+          jq -e '
+            .documentType == "codex-security.findings"
+            and (.findings | type == "array")
+          ' "$SCAN_DIR/findings.json" > /dev/null
+
+          npx --yes @openai/codex-security@0.8.2 export \
+            "$SCAN_DIR" \
+            --source-root . \
+            --output "$SCAN_DIR/results.sarif"
+
+          jq -e '.version == "2.1.0"' \
+            "$SCAN_DIR/results.sarif" > /dev/null
+
+          cp "$RUNNER_TEMP/scan.log" "$SCAN_DIR/scan.log"
+
+          echo "Mock scan exit code: $scan_rc"
+          echo "SARIF validated."
+
+      - name: Upload scan evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: security-scan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cs-results/
+          retention-days: 7
+          if-no-files-found: error
+
+  report:
+    name: Report to PR
+    needs: scan
+    if: >-
+      always() &&
+      github.repository == 'toasted-cornkernels/codeql-sap-js'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Post scan receipt
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+          HEAD: ${{ inputs.head }}
+          KB: ${{ inputs.kb }}
+          BLOB: ${{ inputs.blob }}
+          SCAN_RESULT: ${{ needs.scan.result }}
+        run: |
+          set -euo pipefail
+
+          [[ "$PR" =~ ^[0-9]+$ ]]
+
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" \
+            > /dev/null
+
+          url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          body="$(cat <<EOF
+          ## Codex Security — Mock Scan
+
+          - **Result:** $SCAN_RESULT
+          - **PR head:** \`$HEAD\`
+          - **Knowledge Base:** \`$KB\`
+          - **KB blob:** \`$BLOB\`
+          - **Run:** $url
+          - **Run attempt:** $GITHUB_RUN_ATTEMPT
+
+          **Synthetic findings only. No LLM was called.**
+
+          <!-- codex-security-scan:PR-$PR:run-$GITHUB_RUN_ID -->
+          EOF
+          )"
+
+          gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            -f body="$body"

@@ -1,0 +1,174 @@
+name: Codex Security Dispatcher
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+concurrency:
+  group: security-dispatch-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    if: >-
+      github.repository == 'toasted-cornkernels/codeql-sap-js' &&
+      github.event.issue.pull_request &&
+      (github.event.comment.body == '/security scan' ||
+       github.event.comment.body == '/security rerun')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Authorize and dispatch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.issue.number }}
+          AUTHOR: ${{ github.event.comment.user.login }}
+          COMMAND: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+
+          permission="$(
+            gh api \
+              "repos/$GITHUB_REPOSITORY/collaborators/$AUTHOR/permission" \
+              --jq '.permission'
+          )"
+
+          case "$permission" in
+            admin|write) ;;
+            *) echo "::error::Unauthorized: $permission"; exit 1 ;;
+          esac
+
+          pr_json="$(
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$PR"
+          )"
+
+          [[ "$(jq -r '.state' <<< "$pr_json")" == "open" ]] ||
+            { echo "::error::PR is not open"; exit 1; }
+
+          comments="$(
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/issues/$PR/comments?per_page=100" |
+              jq -s 'add'
+          )"
+
+          if [[ "$COMMAND" == "/security rerun" ]]; then
+            run_id="$(
+              jq -er --arg pr "$PR" '
+                [
+                  .[]
+                  | select(.user.login == "github-actions[bot]")
+                  | .body
+                  | capture(
+                      "<!-- codex-security-scan:PR-(?<pr>[0-9]+):run-(?<run>[0-9]+) -->"
+                    )
+                  | select(.pr == $pr)
+                  | .run
+                ] | last // empty
+              ' <<< "$comments"
+            )" || {
+              echo "::error::No previous scan receipt"
+              exit 1
+            }
+
+            run_json="$(
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id"
+            )"
+
+            jq -e \
+              --arg repo "$GITHUB_REPOSITORY" \
+              --arg title "Security scan PR #$PR" '
+                .event == "workflow_dispatch"
+                and .head_branch == "main"
+                and .repository.full_name == $repo
+                and .display_title == $title
+                and (.path | startswith(
+                  ".github/workflows/security-scan.yml@"
+                ))
+              ' <<< "$run_json" > /dev/null
+
+            gh api --method POST \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/rerun"
+
+            gh api --method POST \
+              "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+              -f body="Codex Security: rerunning [scan $run_id](https://github.com/$GITHUB_REPOSITORY/actions/runs/$run_id) with its original inputs."
+
+            exit 0
+          fi
+
+          head="$(jq -r '.head.sha' <<< "$pr_json")"
+          base="$(jq -r '.base.sha' <<< "$pr_json")"
+
+          registration="$(
+            jq -cer --arg head "$head" '
+              [
+                .[]
+                | select(.user.login == "github-actions[bot]")
+                | .body as $body
+                | (
+                    $body
+                    | capture(
+                        "<!-- codex-security-context:(?<kb>KB-[0-9]+):(?<blob>[0-9a-f]{40}):(?<head>[0-9a-f]{40}) -->"
+                      )
+                  ) as $r
+                | (
+                    $body
+                    | capture(
+                        "Main commit:\\*\\* `(?<main>[0-9a-f]{40})`"
+                      )
+                  ) as $m
+                | select($r.head == $head)
+                | {
+                    kb: $r.kb,
+                    blob: $r.blob,
+                    main: $m.main
+                  }
+              ] | last // empty
+            ' <<< "$comments"
+          )" || {
+            echo "::error::No trusted KB registration for current PR head"
+            exit 1
+          }
+
+          kb="$(jq -r '.kb' <<< "$registration")"
+          blob="$(jq -r '.blob' <<< "$registration")"
+          main="$(jq -r '.main' <<< "$registration")"
+
+          # Verify the exact, previously approved document.
+          kb_json="$(
+            gh api \
+              "repos/$GITHUB_REPOSITORY/contents/security/knowledge/$kb.md?ref=$main"
+          )"
+
+          [[ "$(jq -r '.sha' <<< "$kb_json")" == "$blob" ]] ||
+            { echo "::error::KB SHA mismatch"; exit 1; }
+
+          jq -r '.content' <<< "$kb_json" |
+            base64 --decode |
+            grep -Fxq 'Status: Approved' || {
+              echo "::error::KB is not approved"
+              exit 1
+            }
+
+          # Delegate execution to a separate workflow.
+          gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/security-scan.yml/dispatches" \
+            -f ref=main \
+            -f "inputs[pr]=$PR" \
+            -f "inputs[base]=$base" \
+            -f "inputs[head]=$head" \
+            -f "inputs[kb]=$kb" \
+            -f "inputs[blob]=$blob" \
+            -f "inputs[main]=$main"
+
+          gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            -f body="Codex Security: mock scan requested for PR #$PR using $kb at $blob. A separate workflow will publish the result."
