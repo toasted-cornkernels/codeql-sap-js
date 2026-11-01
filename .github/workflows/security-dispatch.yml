@@ -35,6 +35,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          [[ "$PR" =~ ^[0-9]+$ ]] || {
+            echo '::error::Invalid PR number'
+            exit 1
+          }
+
           permission="$(
             gh api \
               "repos/$GITHUB_REPOSITORY/collaborators/$AUTHOR/permission" \
@@ -50,8 +55,10 @@ jobs:
             gh api "repos/$GITHUB_REPOSITORY/pulls/$PR"
           )"
 
-          [[ "$(jq -r '.state' <<< "$pr_json")" == "open" ]] ||
-            { echo "::error::PR is not open"; exit 1; }
+          [[ "$(jq -r '.state' <<< "$pr_json")" == 'open' ]] || {
+            echo '::error::PR is not open'
+            exit 1
+          }
 
           comments="$(
             gh api --paginate \
@@ -59,7 +66,8 @@ jobs:
               jq -s 'add'
           )"
 
-          if [[ "$COMMAND" == "/security rerun" ]]; then
+          if [[ "$COMMAND" == '/security rerun' ]]; then
+            # Find the most recent scan receipt posted by GitHub Actions.
             run_id="$(
               jq -er --arg pr "$PR" '
                 [
@@ -74,7 +82,12 @@ jobs:
                 ] | last // empty
               ' <<< "$comments"
             )" || {
-              echo "::error::No previous scan receipt"
+              echo '::error::No previous scan receipt'
+              exit 1
+            }
+
+            [[ "$run_id" =~ ^[0-9]+$ ]] || {
+              echo '::error::Invalid scan run ID'
               exit 1
             }
 
@@ -82,17 +95,34 @@ jobs:
               gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id"
             )"
 
-            jq -e \
+            # Identify the scan workflow by GitHub's stable workflow ID,
+            # not by its human-facing run title or path formatting.
+            expected_workflow_id="$(
+              gh api \
+                "repos/$GITHUB_REPOSITORY/actions/workflows/security-scan.yml" \
+                --jq '.id'
+            )"
+
+            if ! jq -e \
               --arg repo "$GITHUB_REPOSITORY" \
-              --arg title "Security scan PR #$PR" '
+              --argjson workflow_id "$expected_workflow_id" '
                 .event == "workflow_dispatch"
                 and .head_branch == "main"
                 and .repository.full_name == $repo
-                and .display_title == $title
-                and (.path | startswith(
-                  ".github/workflows/security-scan.yml@"
-                ))
-              ' <<< "$run_json" > /dev/null
+                and .workflow_id == $workflow_id
+                and .status == "completed"
+              ' <<< "$run_json" > /dev/null; then
+              echo '::error::Previous run failed identity verification'
+              jq '{
+                event,
+                head_branch,
+                workflow_id,
+                path,
+                display_title,
+                status
+              }' <<< "$run_json"
+              exit 1
+            fi
 
             gh api --method POST \
               "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/rerun"
@@ -104,8 +134,16 @@ jobs:
             exit 0
           fi
 
+          # A new scan uses the current PR head and a trusted, pinned KB.
           head="$(jq -r '.head.sha' <<< "$pr_json")"
           base="$(jq -r '.base.sha' <<< "$pr_json")"
+
+          for sha in "$head" "$base"; do
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || {
+              echo '::error::Invalid PR commit SHA'
+              exit 1
+            }
+          done
 
           registration="$(
             jq -cer --arg head "$head" '
@@ -134,7 +172,7 @@ jobs:
               ] | last // empty
             ' <<< "$comments"
           )" || {
-            echo "::error::No trusted KB registration for current PR head"
+            echo '::error::No trusted KB registration for current PR head'
             exit 1
           }
 
@@ -142,23 +180,24 @@ jobs:
           blob="$(jq -r '.blob' <<< "$registration")"
           main="$(jq -r '.main' <<< "$registration")"
 
-          # Verify the exact, previously approved document.
           kb_json="$(
             gh api \
               "repos/$GITHUB_REPOSITORY/contents/security/knowledge/$kb.md?ref=$main"
           )"
 
-          [[ "$(jq -r '.sha' <<< "$kb_json")" == "$blob" ]] ||
-            { echo "::error::KB SHA mismatch"; exit 1; }
+          [[ "$(jq -r '.sha' <<< "$kb_json")" == "$blob" ]] || {
+            echo '::error::KB SHA mismatch'
+            exit 1
+          }
 
           jq -r '.content' <<< "$kb_json" |
             base64 --decode |
             grep -Fxq 'Status: Approved' || {
-              echo "::error::KB is not approved"
+              echo '::error::KB is not approved'
               exit 1
             }
 
-          # Delegate execution to a separate workflow.
+          # The worker has its own independently scoped permissions.
           gh api --method POST \
             "repos/$GITHUB_REPOSITORY/actions/workflows/security-scan.yml/dispatches" \
             -f ref=main \
@@ -172,3 +211,4 @@ jobs:
           gh api --method POST \
             "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
             -f body="Codex Security: mock scan requested for PR #$PR using $kb at $blob. A separate workflow will publish the result."
+
